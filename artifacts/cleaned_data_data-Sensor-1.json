@@ -1,0 +1,114 @@
+{
+  "approved": true,
+  "status": "Approved",
+  "detected_outliers": [
+    {
+      "Date": "5",
+      "Website_Visits": 24.0
+    },
+    {
+      "Date": "16",
+      "Website_Visits": -55.98
+    }
+  ],
+  "cleaned_data_rows": [
+    {
+      "Date": "1",
+      "Website_Visits": 0.12
+    },
+    {
+      "Date": "2",
+      "Website_Visits": 0.83
+    },
+    {
+      "Date": "3",
+      "Website_Visits": 1.37
+    },
+    {
+      "Date": "4",
+      "Website_Visits": 1.11
+    },
+    {
+      "Date": "6",
+      "Website_Visits": -0.78
+    },
+    {
+      "Date": "7",
+      "Website_Visits": -1.42
+    },
+    {
+      "Date": "8",
+      "Website_Visits": -1.18
+    },
+    {
+      "Date": "9",
+      "Website_Visits": -0.21
+    },
+    {
+      "Date": "10",
+      "Website_Visits": 0.91
+    },
+    {
+      "Date": "11",
+      "Website_Visits": 1.48
+    },
+    {
+      "Date": "12",
+      "Website_Visits": 1.09
+    },
+    {
+      "Date": "13",
+      "Website_Visits": 0.05
+    },
+    {
+      "Date": "14",
+      "Website_Visits": -1.02
+    },
+    {
+      "Date": "15",
+      "Website_Visits": -1.55
+    },
+    {
+      "Date": "17",
+      "Website_Visits": 0.15
+    },
+    {
+      "Date": "18",
+      "Website_Visits": 1.18
+    },
+    {
+      "Date": "19",
+      "Website_Visits": 1.62
+    }
+  ],
+  "removed_rows": [
+    {
+      "Date": "5",
+      "Website_Visits": 24.0
+    },
+    {
+      "Date": "16",
+      "Website_Visits": -55.98
+    }
+  ],
+  "assumptions": [
+    "The single numeric column 'Sensor Value' was mapped to 'Website_Visits' and row index to 'Date' to satisfy the required schema.",
+    "Rows are indexed from 1 to 19 in the order they appear after the header.",
+    "Outliers were detected using the IQR rule: values < Q1 - 1.5*IQR or > Q3 + 1.5*IQR are outliers.",
+    "Values 24.0 (row 5) and -55.98 (row 16) are the only outliers and were removed to form the cleaned dataset.",
+    "All statistics (count, mean, median, std, min, max) are computed only on the cleaned dataset.",
+    "No missing or non-numeric values were present, so no imputation was required."
+  ],
+  "statistics": {
+    "count": 17,
+    "mean": 0.2071,
+    "median": 0.12,
+    "std": 1.0817,
+    "min": -1.55,
+    "max": 1.62
+  },
+  "validation_notes": [
+    "Outlier removal check: the values 24.0 and -55.98 do not appear in the cleaned_data_rows but are present in removed_rows, so outlier removal is consistent.",
+    "Statistical validity check: descriptive statistics were recomputed using only the 17 cleaned observations; no removed outliers were included in these calculations."
+  ]
+}
