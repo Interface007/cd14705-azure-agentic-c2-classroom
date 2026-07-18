@@ -214,8 +214,31 @@ def get_csv_name():
         print("Selection out of range. Try again.")
 
 def load_csv_frame(file_path: str) -> pd.DataFrame:
-    """Loads a CSV file while preserving column structure."""
-    frame = pd.read_csv(file_path)
+    csv_path = Path(file_path)
+    try:
+        frame = pd.read_csv(csv_path)
+    except FileNotFoundError as ex:
+        trace_event("csv_read_failed", csv_path=str(csv_path), error_type="FileNotFoundError", error=str(ex))
+        raise FileNotFoundError(f"CSV file not found: {csv_path}") from ex
+    except PermissionError as ex:
+        trace_event("csv_read_failed", csv_path=str(csv_path), error_type="PermissionError", error=str(ex))
+        raise PermissionError(f"Permission denied while reading CSV file: {csv_path}") from ex
+    except pd.errors.EmptyDataError as ex:
+        trace_event("csv_read_failed", csv_path=str(csv_path), error_type="EmptyDataError", error=str(ex))
+        raise ValueError(f"CSV file is empty or has no readable columns: {csv_path}") from ex
+    except pd.errors.ParserError as ex:
+        trace_event("csv_read_failed", csv_path=str(csv_path), error_type="ParserError", error=str(ex))
+        raise ValueError(f"CSV parsing failed for '{csv_path}'. Check delimiter/quoting and file format.") from ex
+    except UnicodeDecodeError as ex:
+        trace_event("csv_read_failed", csv_path=str(csv_path), error_type="UnicodeDecodeError", error=str(ex))
+        raise ValueError(f"CSV encoding is not readable as UTF-8-compatible text: {csv_path}") from ex
+    except OSError as ex:
+        trace_event("csv_read_failed", csv_path=str(csv_path), error_type="OSError", error=str(ex))
+        raise OSError(f"File-system error while reading CSV '{csv_path}': {ex}") from ex
+    except Exception as ex:
+        trace_event("unexpected_error", error_type=type(ex).__name__, error=str(ex))
+        raise
+
     frame.columns = [str(column).strip() for column in frame.columns]
     return frame
 
@@ -587,6 +610,28 @@ class PythonExecutor:
 
         return False, last_error, current_code, last_output
 
+
+def safe_write_text(path: Path, content: str, description: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as ex:
+        trace_event("output_write_failed", path=str(path), description=description, stage="mkdir", error=str(ex))
+        raise OSError(f"Could not create output directory for {description} at '{path}': {ex}") from ex
+    except Exception as ex:
+        trace_event("unexpected_error", error_type=type(ex).__name__, error=str(ex))
+        raise
+
+    try:
+        path.write_text(content, encoding="utf-8")
+    except OSError as ex:
+        trace_event("output_write_failed", path=str(path), description=description, stage="write", error=str(ex))
+        raise OSError(f"Could not write {description} to '{path}': {ex}") from ex
+    except Exception as ex:
+        trace_event("unexpected_error", error_type=type(ex).__name__, error=str(ex))
+        raise
+
+    trace_event("output_written", path=str(path), description=description, bytes=len(content.encode("utf-8")))
+
 def save_final_report(report, path='artifacts/final_report.md'):
     """
     Saves the generated final report to a markdown file.
@@ -597,8 +642,7 @@ def save_final_report(report, path='artifacts/final_report.md'):
                               Defaults to 'artifacts/final_report.md'.
     """
     output = Path(path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(report, encoding="utf-8")
+    safe_write_text(output, report, "final report")
 
 
 def extract_code_block(text: str) -> str:
@@ -980,7 +1024,7 @@ async def main():
     trace_event("analysis_validation_completed", approved=approved, notes_count=len(validation_notes))
 
     analysis_output = json.dumps(analysis_payload, indent=2, ensure_ascii=True)
-    analysis_output_path.write_text(analysis_output, encoding="utf-8")
+    safe_write_text(analysis_output_path, analysis_output, "analysis output JSON")
     trace_event(
         "analysis_output_saved",
         path=str(analysis_output_path),
@@ -1001,10 +1045,8 @@ async def main():
 
     # 5. Save the cleaned data as JSON.
     cleaned_data_payload = analysis_payload
-    cleaned_data_path.write_text(
-        json.dumps(cleaned_data_payload, indent=2, ensure_ascii=True),
-        encoding="utf-8",
-    )
+    cleaned_data_json = json.dumps(cleaned_data_payload, indent=2, ensure_ascii=True)
+    safe_write_text(cleaned_data_path, cleaned_data_json, "cleaned data JSON")
     trace_event("cleaned_data_saved", path=str(cleaned_data_path))
 
     # 6. Invoke the code chat to generate and execute visualization code.
@@ -1039,7 +1081,7 @@ async def main():
     )
 
     # 7. Save the working visualization script.
-    visualization_script_path.write_text(generated_code, encoding="utf-8")
+    safe_write_text(visualization_script_path, generated_code, "visualization script")
     trace_event("visualization_script_saved", path=str(visualization_script_path))
 
     # 7.a Check if execution was successful after retries - we want the script even if it fails to check for the error.
