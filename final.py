@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import math
 import subprocess
 import sys
 import tempfile
@@ -130,6 +131,9 @@ trace_event("chat_service_initialized", service_id="default", deployment_name=DE
 # -----------------
 # Helper Functions
 # -----------------
+ROW_ID_FIELD = "_row_id"
+
+
 def _load_text_lines(base_dir: str, file_name: str) -> list[str]:
     file_path = Path(base_dir) / file_name
     if not file_path.exists():
@@ -209,21 +213,210 @@ def get_csv_name():
 
         print("Selection out of range. Try again.")
 
-def load_csv_file(file_path):
-    """
-    Reads a CSV file and converts its entire content into a single string.
-
-    The CSV data is flattened into a list and then joined by ', '.
-
-    Args:
-        file_path (str): The path to the CSV file to load.
-
-    Returns:
-        str: A single string containing all the data from the CSV file.
-    """
+def load_csv_frame(file_path: str) -> pd.DataFrame:
+    """Loads a CSV file while preserving column structure."""
     frame = pd.read_csv(file_path)
-    flattened = list(frame.columns.astype(str)) + frame.astype(str).to_numpy().flatten().tolist()
-    return ", ".join(flattened)
+    frame.columns = [str(column).strip() for column in frame.columns]
+    return frame
+
+
+def _to_serializable_value(value):
+    if pd.isna(value):
+        return None
+
+    if hasattr(value, "item"):
+        value = value.item()
+
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+
+    return value
+
+
+def _dataframe_to_records(frame: pd.DataFrame) -> list[dict]:
+    records: list[dict] = []
+    for row in frame.to_dict(orient="records"):
+        records.append({str(key): _to_serializable_value(value) for key, value in row.items()})
+    return records
+
+
+def infer_analysis_columns(frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None, str]:
+    """Chooses the metric column and optional index column from the CSV schema."""
+    working_frame = frame.copy()
+
+    candidate_numeric_columns: list[str] = []
+    for column in working_frame.columns:
+        if column == ROW_ID_FIELD:
+            continue
+
+        series = working_frame[column]
+        if pd.api.types.is_numeric_dtype(series):
+            candidate_numeric_columns.append(column)
+            continue
+
+        converted = pd.to_numeric(series, errors="coerce")
+        if converted.notna().all():
+            working_frame[column] = converted
+            candidate_numeric_columns.append(column)
+
+    if not candidate_numeric_columns:
+        raise ValueError("No numeric column found for analysis.")
+
+    value_field = candidate_numeric_columns[-1]
+    index_field = next((column for column in working_frame.columns if column not in {value_field, ROW_ID_FIELD}), None)
+
+    if not pd.api.types.is_numeric_dtype(working_frame[value_field]):
+        working_frame[value_field] = pd.to_numeric(working_frame[value_field], errors="coerce")
+
+    if working_frame[value_field].isna().any():
+        raise ValueError(f"Column '{value_field}' contains non-numeric values and cannot be analyzed.")
+
+    return working_frame, index_field, value_field
+
+
+def detect_outlier_mask(values: pd.Series) -> pd.Series:
+    """Uses the IQR rule to mark outliers in the target metric."""
+    q1 = values.quantile(0.25)
+    q3 = values.quantile(0.75)
+    iqr = q3 - q1
+
+    if pd.isna(iqr) or iqr == 0:
+        return pd.Series(False, index=values.index)
+
+    lower_bound = q1 - (1.5 * iqr)
+    upper_bound = q3 + (1.5 * iqr)
+    return (values < lower_bound) | (values > upper_bound)
+
+
+def validate_analysis_payload(payload: dict) -> tuple[bool, list[str]]:
+    """Validates cleaned vs removed rows and checks statistics for plausibility only."""
+    value_field = payload["value_field"]
+    cleaned_frame = pd.DataFrame(payload["cleaned_data_rows"])
+    removed_frame = pd.DataFrame(payload["removed_rows"])
+
+    notes: list[str] = []
+    approved = True
+
+    cleaned_signatures = [json.dumps(row, sort_keys=True, default=str) for row in payload["cleaned_data_rows"]]
+    removed_signatures = [json.dumps(row, sort_keys=True, default=str) for row in payload["removed_rows"]]
+
+    if set(cleaned_signatures).intersection(removed_signatures):
+        approved = False
+        notes.append("Outlier Removal Check FAILED: cleaned_data_rows and removed_rows overlap.")
+    else:
+        notes.append("Outlier Removal Check: Passed. cleaned_data_rows and removed_rows are disjoint.")
+
+    reported_stats = payload["statistics"]
+    is_valid_stats, stats_validation_message = validate_statistics_output({"statistics": reported_stats})
+    if not is_valid_stats:
+        approved = False
+        notes.append("Statistical Plausibility Check FAILED: " + stats_validation_message)
+    else:
+        plausibility_issues: list[str] = []
+
+        cleaned_values = pd.to_numeric(cleaned_frame[value_field], errors="coerce")
+        if cleaned_values.isna().any():
+            approved = False
+            notes.append("Statistical Plausibility Check FAILED: cleaned_data_rows contains non-numeric metric values.")
+        else:
+            data_count = int(cleaned_values.count())
+            data_min = float(cleaned_values.min())
+            data_max = float(cleaned_values.max())
+
+            if "count" in reported_stats:
+                try:
+                    reported_count = int(float(reported_stats["count"]))
+                    if reported_count != data_count:
+                        plausibility_issues.append(f"count mismatch: reported {reported_count}, expected {data_count}")
+                except (TypeError, ValueError):
+                    plausibility_issues.append("count is not parseable as integer")
+
+            if "std" in reported_stats and float(reported_stats["std"]) < 0:
+                plausibility_issues.append("std must be >= 0")
+
+            if "min" in reported_stats and "max" in reported_stats:
+                reported_min = float(reported_stats["min"])
+                reported_max = float(reported_stats["max"])
+                if reported_min > reported_max:
+                    plausibility_issues.append("min cannot be greater than max")
+
+                if reported_min < data_min - 1e-9 or reported_min > data_max + 1e-9:
+                    plausibility_issues.append(
+                        f"reported min {reported_min} is outside observed data range [{data_min}, {data_max}]"
+                    )
+                if reported_max < data_min - 1e-9 or reported_max > data_max + 1e-9:
+                    plausibility_issues.append(
+                        f"reported max {reported_max} is outside observed data range [{data_min}, {data_max}]"
+                    )
+
+                if "mean" in reported_stats:
+                    reported_mean = float(reported_stats["mean"])
+                    if reported_mean < reported_min - 1e-9 or reported_mean > reported_max + 1e-9:
+                        plausibility_issues.append("mean is outside [min, max]")
+
+                if "median" in reported_stats:
+                    reported_median = float(reported_stats["median"])
+                    if reported_median < reported_min - 1e-9 or reported_median > reported_max + 1e-9:
+                        plausibility_issues.append("median is outside [min, max]")
+
+            if plausibility_issues:
+                approved = False
+                notes.append("Statistical Plausibility Check FAILED: " + "; ".join(plausibility_issues))
+            else:
+                notes.append("Statistical Plausibility Check: Passed. Statistics are structurally valid and plausible.")
+
+    if ROW_ID_FIELD in removed_frame.columns:
+        notes.append(f"Validation Detail: {len(removed_frame)} outlier rows removed using the IQR rule on '{value_field}'.")
+
+    return approved, notes
+
+
+def build_cleaning_payload(frame: pd.DataFrame, csv_path: str) -> dict:
+    """Builds a cleaned analysis payload without hardcoding the statistics computation path."""
+    working_frame, index_field, value_field = infer_analysis_columns(frame)
+    working_frame.insert(0, ROW_ID_FIELD, range(1, len(working_frame) + 1))
+
+    outlier_mask = detect_outlier_mask(working_frame[value_field])
+    cleaned_frame = working_frame.loc[~outlier_mask].reset_index(drop=True)
+    removed_frame = working_frame.loc[outlier_mask].reset_index(drop=True)
+
+    payload = {
+        "approved": False,
+        "status": "Failed",
+        "dataset_path": csv_path,
+        "columns": list(frame.columns),
+        "index_field": index_field,
+        "value_field": value_field,
+        "outlier_method": "IQR (1.5 * IQR)",
+        "detected_outliers": _dataframe_to_records(removed_frame),
+        "cleaned_data_rows": _dataframe_to_records(cleaned_frame),
+        "removed_rows": _dataframe_to_records(removed_frame),
+        "assumptions": [
+            f"The analysis uses the original CSV schema from '{csv_path}' instead of mapping fields to a fixed report schema.",
+            f"The numeric metric column selected for analysis is '{value_field}'.",
+            (
+                f"The column '{index_field}' is preserved as the contextual/index field."
+                if index_field
+                else "No natural index column exists, so only the source row id is preserved for traceability."
+            ),
+            "Outliers are detected deterministically with the IQR rule and removed before statistics are computed.",
+            "Descriptive statistics are generated via model-authored Python code and then validated programmatically.",
+        ],
+        "statistics": {},
+        "validation_notes": [],
+    }
+
+    trace_event(
+        "deterministic_cleaning_completed",
+        csv_path=csv_path,
+        row_count=len(frame),
+        cleaned_row_count=len(cleaned_frame),
+        removed_row_count=len(removed_frame),
+        index_field=index_field,
+        value_field=value_field,
+    )
+    return payload
+
 
 class PythonExecutor:
     """
@@ -262,7 +455,7 @@ class PythonExecutor:
             "locals",
             "vars",
         }
-        allowed_import_roots = {"pandas", "matplotlib"}
+        allowed_import_roots = {"pandas", "matplotlib", "json"}
 
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -285,7 +478,7 @@ class PythonExecutor:
             if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
                 raise ValueError("Dunder attribute access is blocked")
 
-    def _run_once(self, code: str) -> tuple[bool, str | None]:
+    def _run_once(self, code: str) -> tuple[bool, str | None, str]:
         """Runs code in an isolated interpreter process."""
         self._validate_code_safety(code)
 
@@ -303,13 +496,14 @@ class PythonExecutor:
                 check=False,
             )
 
+            stdout_text = (result.stdout or "").strip()
             if result.returncode == 0:
-                return True, None
+                return True, None, stdout_text
 
             details = (result.stderr or "").strip() or (result.stdout or "").strip()
-            return False, details or f"Execution failed with exit code {result.returncode}"
+            return False, details or f"Execution failed with exit code {result.returncode}", stdout_text
         except subprocess.TimeoutExpired:
-            return False, f"Execution timed out after {self.timeout_seconds} seconds"
+            return False, f"Execution timed out after {self.timeout_seconds} seconds", ""
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 try:
@@ -342,7 +536,7 @@ class PythonExecutor:
         for attempt in range(1, self.max_attempts + 1):
             trace_event("code_execution_attempt_started", attempt=attempt)
             try:
-                ok, err = self._run_once(current_code)
+                ok, err, _ = self._run_once(current_code)
             except Exception:
                 ok = False
                 err = traceback.format_exc()
@@ -359,6 +553,39 @@ class PythonExecutor:
             current_code = await repair_callback(attempt, last_error, current_code)
 
         return False, last_error, current_code
+
+    async def run_capture_output(
+        self,
+        code: str,
+        repair_callback: Callable[[int, str, str], Awaitable[str]] | None = None,
+    ) -> tuple[bool, str | None, str, str]:
+        """Executes code with retries and returns captured stdout from the final successful run."""
+        current_code = code
+        last_error: str | None = None
+        last_output = ""
+
+        for attempt in range(1, self.max_attempts + 1):
+            trace_event("code_execution_attempt_started", attempt=attempt)
+            try:
+                ok, err, output_text = self._run_once(current_code)
+            except Exception:
+                ok = False
+                err = traceback.format_exc()
+                output_text = ""
+            if ok:
+                trace_event("code_execution_attempt_succeeded", attempt=attempt)
+                return True, None, current_code, output_text
+
+            last_error = err or "Unknown execution error"
+            last_output = output_text
+            trace_event("code_execution_attempt_failed", attempt=attempt, error=last_error)
+
+            if attempt >= self.max_attempts or repair_callback is None:
+                break
+
+            current_code = await repair_callback(attempt, last_error, current_code)
+
+        return False, last_error, current_code, last_output
 
 def save_final_report(report, path='artifacts/final_report.md'):
     """
@@ -379,6 +606,44 @@ def extract_code_block(text: str) -> str:
     if match:
         return match.group(1).strip()
     return text.strip()
+
+
+def extract_json_object(text: str) -> dict | None:
+    """Extracts the first decodable JSON object from free-form stdout text."""
+    decoder = json.JSONDecoder()
+    for start_index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            payload, _ = decoder.raw_decode(text[start_index:])
+            if isinstance(payload, dict):
+                return payload
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def validate_statistics_output(payload: dict) -> tuple[bool, str]:
+    """Validates that the statistics payload is a numeric dictionary (shape only)."""
+    if not isinstance(payload, dict):
+        return False, "Output is not a JSON object."
+
+    statistics = payload.get("statistics")
+    if not isinstance(statistics, dict):
+        return False, "Missing top-level 'statistics' object."
+
+    if not statistics:
+        return False, "'statistics' object is empty."
+
+    try:
+        for key, value in statistics.items():
+            numeric_value = float(value)
+            if not math.isfinite(numeric_value):
+                return False, f"Statistics value for '{key}' must be finite."
+    except (TypeError, ValueError) as ex:
+        return False, f"Statistics values must be numeric scalars: {ex}"
+
+    return True, "ok"
 
 
 async def run_group_chat(chat: AgentGroupChat, prompt: str, final_message_only: bool = False) -> str:
@@ -441,13 +706,17 @@ Output requirements:
   - assumptions: array of strings
 """.strip(),
     "DataStatistics": """
-Role: Statistical Analysis.
-Behavior: Generate key descriptive statistics from the cleaned data.
+Role: Statistical Analysis via Python.
+Behavior: Generate executable Python code that computes descriptive statistics from cleaned data.
 Rules:
-- Calculate statistics from the cleaned data only.
-- Do not extrapolate additional data.
-- Include mean, median, std, min, max and short interpretation.
-- Return ONLY valid JSON (no markdown, no prose) with a `statistics` object.
+- Return ONLY executable Python code in a single markdown code block.
+- Use pandas and json only.
+- Read the provided JSON payload from a variable named `analysis_input_json`.
+- Build a DataFrame from `cleaned_data_rows` and use `value_field` as metric column.
+- Compute count, mean, median, std (sample std, ddof=1), min, max from cleaned rows only.
+- Round mean, median, std to 6 decimals.
+- Print ONLY one valid JSON object: {"statistics": {...}}.
+- Do not include prose, explanations, or markdown outside the code block.
 """.strip(),
     "AnalysisChecker": (
         "Role: Validation. Behavior: Verify that the analysis meets predefined quality instructions.\n"
@@ -515,7 +784,16 @@ class ApprovalTerminationStrategy(TerminationStrategy):
     """A custom termination strategy that stops after user approval."""
     async def should_agent_terminate(self, agent, history):
         if history and getattr(history[-1], "content", None):
-            if "approved" in history[-1].content.lower():
+            content = history[-1].content.strip()
+            if content.lower() == "approved":
+                return True
+
+            try:
+                payload = json.loads(content)
+            except json.JSONDecodeError:
+                payload = None
+
+            if isinstance(payload, dict) and payload.get("approved") is True:
                 return True
 
         if len(history) >= self.maximum_iterations:
@@ -574,6 +852,10 @@ analysis_chat = AgentGroupChat(
     agents=[cleaning_agent, stats_agent, checker_agent],
     termination_strategy=ApprovalTerminationStrategy(maximum_iterations=6, automatic_reset=True),
 )
+stats_code_chat = AgentGroupChat(
+    agents=[stats_agent],
+    termination_strategy=ApprovalTerminationStrategy(maximum_iterations=1, automatic_reset=True),
+)
 code_chat = AgentGroupChat(
     agents=[python_agent],
     termination_strategy=ApprovalTerminationStrategy(maximum_iterations=4, automatic_reset=True),
@@ -604,18 +886,100 @@ async def main():
     visualization_script_path = Path("artifacts") / f"visualization_{dataset_tag}.py"
     final_report_path = Path("artifacts") / f"final_report_{dataset_tag}.md"
     trace_event("csv_selected", csv_path=csv_path)
-    csv_text = load_csv_file(csv_path)
-    trace_event("csv_loaded", csv_path=csv_path, csv_text_length=len(csv_text))
-
-    # 2. Invoke the analysis chat.
-    analysis_prompt = (
-        "Analyze, clean, compute descriptive stats, and validate this CSV data. "
-        "The FINAL output must be ONLY one valid JSON object following the checker schema. "
-        "Do not return markdown.\n\n"
-        f"CSV path: {csv_path}\n"
-        f"CSV data:\n{csv_text}"
+    csv_frame = load_csv_frame(csv_path)
+    trace_event(
+        "csv_loaded",
+        csv_path=csv_path,
+        row_count=len(csv_frame),
+        column_names=list(csv_frame.columns),
     )
-    analysis_output = await run_group_chat(analysis_chat, analysis_prompt, final_message_only=True)
+
+    # 2. Build deterministic cleaning payload.
+    analysis_payload = build_cleaning_payload(csv_frame, csv_path)
+
+    # 3. Generate statistics code with the DataStatistics agent and execute it.
+    stats_prompt = (
+        "Generate Python code that computes descriptive stats for this cleaned analysis payload. "
+        "Return code only.\n\n"
+        f"analysis_input_json = '''{json.dumps(analysis_payload, ensure_ascii=True)}'''"
+    )
+    stats_code_response = await run_group_chat(stats_code_chat, stats_prompt, final_message_only=True)
+    stats_code = extract_code_block(stats_code_response)
+    trace_event("stats_code_generated", code_length=len(stats_code))
+
+    stats_executor = PythonExecutor(max_attempts=3)
+
+    async def repair_stats_code(attempt: int, execution_error: str, current_code: str) -> str:
+        repair_prompt = (
+            "Fix the Python statistics script. Return only corrected Python code.\n\n"
+            f"Attempt: {attempt}\n"
+            f"Error:\n{execution_error}\n\n"
+            f"Current code:\n```python\n{current_code}\n```"
+        )
+        repaired_response = await run_group_chat(stats_code_chat, repair_prompt, final_message_only=True)
+        repaired_code = extract_code_block(repaired_response)
+        trace_event("stats_code_regenerated", attempt=attempt, code_length=len(repaired_code))
+        return repaired_code
+
+    max_stats_output_attempts = 3
+    stats_payload: dict | None = None
+    last_stats_guard_error = "Unknown statistics output validation error"
+
+    for output_attempt in range(1, max_stats_output_attempts + 1):
+        stats_ok, stats_error, stats_code, stats_stdout = await stats_executor.run_capture_output(
+            stats_code,
+            repair_callback=repair_stats_code,
+        )
+        if not stats_ok:
+            trace_event("workflow_failed", reason="statistics_code_failed")
+            raise RuntimeError(f"Statistics code failed after retries:\n{stats_error}")
+
+        candidate_payload = extract_json_object(stats_stdout)
+        if candidate_payload is None:
+            last_stats_guard_error = "Script did not print a JSON object."
+        else:
+            is_valid_stats, validation_message = validate_statistics_output(candidate_payload)
+            if is_valid_stats:
+                stats_payload = candidate_payload
+                trace_event("statistics_output_validated", attempt=output_attempt)
+                break
+            last_stats_guard_error = validation_message
+
+        trace_event(
+            "statistics_output_invalid",
+            attempt=output_attempt,
+            error=last_stats_guard_error,
+            stdout_length=len(stats_stdout or ""),
+        )
+        if output_attempt >= max_stats_output_attempts:
+            break
+
+        guard_prompt = (
+            "Your script executed, but the printed output is invalid for the required schema. "
+            "Return only corrected Python code that prints EXACTLY one JSON object with a top-level "
+            "'statistics' object containing numeric scalar values.\n\n"
+            f"Validation error: {last_stats_guard_error}\n\n"
+            f"Last stdout:\n{stats_stdout}\n\n"
+            f"Current code:\n```python\n{stats_code}\n```\n\n"
+            f"analysis_input_json = '''{json.dumps(analysis_payload, ensure_ascii=True)}'''"
+        )
+        repaired_response = await run_group_chat(stats_code_chat, guard_prompt, final_message_only=True)
+        stats_code = extract_code_block(repaired_response)
+        trace_event("stats_code_regenerated_for_output", attempt=output_attempt, code_length=len(stats_code))
+
+    if stats_payload is None:
+        trace_event("workflow_failed", reason="statistics_output_invalid")
+        raise ValueError(f"Statistics script output validation failed: {last_stats_guard_error}")
+
+    analysis_payload["statistics"] = stats_payload["statistics"]
+
+    approved, validation_notes = validate_analysis_payload(analysis_payload)
+    analysis_payload["approved"] = approved
+    analysis_payload["status"] = "Approved" if approved else "Failed"
+    analysis_payload["validation_notes"] = validation_notes
+    trace_event("analysis_validation_completed", approved=approved, notes_count=len(validation_notes))
+
+    analysis_output = json.dumps(analysis_payload, indent=2, ensure_ascii=True)
     analysis_output_path.write_text(analysis_output, encoding="utf-8")
     trace_event(
         "analysis_output_saved",
@@ -627,7 +991,7 @@ async def main():
     print(analysis_output)
     print("=== End Analysis Result ===\n")
 
-    # 3. Get human approval.
+    # 4. Get human approval.
     approval = input("Approve analysis to continue? (yes/no): ").strip().lower()
     trace_event("human_approval_received", decision=approval)
     if approval != "yes":
@@ -635,22 +999,18 @@ async def main():
         trace_event("workflow_stopped_by_user")
         return
 
-    # 4. Save the cleaned data as JSON.
-    try:
-        cleaned_data_payload = json.loads(analysis_output)
-    except json.JSONDecodeError as ex:
-        trace_event("cleaned_data_json_parse_failed", error=str(ex))
-        raise ValueError("analysis_output is not valid JSON. Update analysis prompts/termination behavior.") from ex
-
+    # 5. Save the cleaned data as JSON.
+    cleaned_data_payload = analysis_payload
     cleaned_data_path.write_text(
         json.dumps(cleaned_data_payload, indent=2, ensure_ascii=True),
         encoding="utf-8",
     )
     trace_event("cleaned_data_saved", path=str(cleaned_data_path))
 
-    # 5. Invoke the code chat to generate and execute visualization code.
+    # 6. Invoke the code chat to generate and execute visualization code.
     code_prompt = (
         "Generate Python code to visualize the cleaned dataset summary from this analysis output. "
+        "Use `value_field` for the metric and `index_field` for the x-axis when present. Ignore helper fields starting with an underscore. "
         f"Save figure to {visualization_image_path.as_posix()}.\n\n"
         f"Analysis output:\n{analysis_output}"
     )
@@ -689,7 +1049,8 @@ async def main():
 
     # 8. Invoke the report chat to generate the final report.
     report_prompt = (
-        "Create the final report in markdown using the template instructions.\n\n"
+        "Create the final report in markdown using the template instructions. "
+        "Use the original field names from the analysis output and do not rename them to Date/Website_Visits unless the dataset already uses those names.\n\n"
         f"Analysis output:\n{analysis_output}\n\n"
         f"Execution logs:\n{os.linesep.join(load_logs('agent_chat.log'))}"
     )
